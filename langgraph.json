@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "market_buddy": "./market_buddy.py:agent"
+  },
+  "env": ".env"
+}
