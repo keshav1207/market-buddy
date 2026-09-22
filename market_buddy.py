@@ -8,6 +8,10 @@ from dotenv import load_dotenv
 from langchain.agents import create_agent
 from langchain.tools import tool
 from langgraph.checkpoint.memory import InMemorySaver
+from langchain.agents.middleware import AgentMiddleware
+import base64
+import mimetypes
+from pathlib import Path
 
 load_dotenv()
 
@@ -90,8 +94,70 @@ TOOLS = [get_quote, get_performance, get_fundamentals, compare_performance]
 SYSTEM_PROMPT = """You are Market Buddy, a friendly capital markets assistant.
 Use your tools to fetch real data before answering; never guess numbers.
 Explain results in plain English and keep answers short.
+
+When the user sends a chart image:
+- Say what you can actually see: ticker, timeframe, overall direction,
+  notable spikes or drops, and any visible axis values.
+- Never state precise prices or percentages read off the image.
+- If you can identify the ticker and timeframe, call get_performance
+  to confirm the real numbers, and give those instead.
+- Say so plainly if the image is unreadable or isn't a price chart.
+- If the image and the tool data disagree, say so explicitly and
+  trust the tool data.
+
 You provide information and analysis only, not buy/sell recommendations."""
 
+
+
+def _fix_block(block):
+    """Convert LangChain/UI-style image blocks into OpenAI image_url blocks."""
+    if not isinstance(block, dict) or block.get("type") != "image":
+        return block
+    data = block.get("data") or block.get("base64")
+    mime = block.get("mime_type") or block.get("mimeType") or "image/png"
+    url = f"data:{mime};base64,{data}" if data else block.get("url")
+    if not url:
+        return block
+    return {"type": "image_url", "image_url": {"url": url}}
+
+
+def _fix_messages(messages):
+    fixed = []
+    for msg in messages:
+        if isinstance(msg.content, list):
+            msg = msg.model_copy(
+                update={"content": [_fix_block(b) for b in msg.content]}
+            )
+        fixed.append(msg)
+    return fixed
+
+def build_message(text: str, image_path: str | None = None) -> dict:
+    """Build a user message, optionally carrying an image."""
+    if not image_path:
+        return {"role": "user", "content": text}
+
+    path = Path(image_path).expanduser()
+    data = base64.b64encode(path.read_bytes()).decode()
+    mime = mimetypes.guess_type(path.name)[0] or "image/png"
+
+    return {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": text},
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime};base64,{data}"},
+            },
+        ],
+    }
+class OpenAIImageBlocks(AgentMiddleware):
+    """Rewrite image blocks on every model call (sync and async)."""
+
+    def wrap_model_call(self, request, handler):
+        return handler(request.override(messages=_fix_messages(request.messages)))
+
+    async def awrap_model_call(self, request, handler):
+        return await handler(request.override(messages=_fix_messages(request.messages)))
 
 # ---------- Agent ----------
 
@@ -100,13 +166,13 @@ def build_agent(checkpointer=None):
         model="openai:gpt-5-mini",  
         tools=TOOLS,
         system_prompt=SYSTEM_PROMPT,
+        middleware=[OpenAIImageBlocks()],
         checkpointer=checkpointer,
     )
 
 
 # Used later by `langgraph dev` / Agent Chat UI (the server provides its own memory).
 agent = build_agent()
-
 
 # ---------- Terminal chat ----------
 
@@ -120,8 +186,15 @@ if __name__ == "__main__":
         question = input("You: ").strip()
         if question.lower() in {"quit", "exit"}:
             break
+
+        # Type: image:/path/to/chart.png What trend is this?
+        image_path = None
+        if question.startswith("image:"):
+            _, rest = question.split(":", 1)
+            image_path, question = rest.strip().split(" ", 1)
+
         result = chat_agent.invoke(
-            {"messages": [{"role": "user", "content": question}]},
+            {"messages": [build_message(question, image_path)]},
             config=config,
         )
         print(f"\nMarket Buddy: {result['messages'][-1].content}\n")
