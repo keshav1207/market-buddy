@@ -6,9 +6,10 @@ Market Buddy - a simple stock Q&A agent built with LangChain.
 import yfinance as yf
 from dotenv import load_dotenv
 from langchain.agents import create_agent
-from langchain.tools import tool
+from langchain.tools import tool, ToolRuntime
 from langgraph.checkpoint.memory import InMemorySaver
-from langchain.agents.middleware import AgentMiddleware
+from langchain.agents.middleware import AgentMiddleware, dynamic_prompt, ModelRequest
+from dataclasses import dataclass
 import base64
 import mimetypes
 from pathlib import Path
@@ -16,24 +17,45 @@ from pathlib import Path
 load_dotenv()
 
 
+
+@dataclass
+class UserProfile:
+    name: str = "there"
+    risk_profile: str = "balanced"     # conservative | balanced | aggressive
+    base_currency: str = "USD"
+
+
+def _fx_rate(to_currency: str) -> float:
+    """USD -> to_currency rate. Returns 1.0 for USD or on failure."""
+    code = to_currency.upper()
+    if code == "USD":
+        return 1.0
+    try:
+        return float(yf.Ticker(f"{code}=X").fast_info.last_price)
+    except Exception:
+        return 1.0
+
 # ---------- Tools ----------
 # The model only sees each tool's name, docstring, and argument types.
 
+
+
 @tool
-def get_quote(ticker: str) -> dict:
+def get_quote(ticker: str, runtime: ToolRuntime[UserProfile]) -> dict:
     """Get the latest price, market cap, and 52-week range
     for a stock ticker (e.g. AAPL)."""
+    profile = runtime.context or UserProfile()
     info = yf.Ticker(ticker).fast_info
+    rate = _fx_rate(profile.base_currency) if info.currency == "USD" else 1.0
+
     return {
         "ticker": ticker.upper(),
-        "price": round(info.last_price, 2),
-        "market_cap": info.market_cap,
-        "52w_high": round(info.year_high, 2),
-        "52w_low": round(info.year_low, 2),
-        "currency": info.currency,
+        "price": round(info.last_price * rate, 2),
+       "market_cap_usd": info.market_cap,
+        "52w_high": round(info.year_high * rate, 2),
+        "52w_low": round(info.year_low * rate, 2),
+        "currency": profile.base_currency if rate != 1.0 else info.currency,
     }
-
-
 @tool
 def get_performance(ticker: str, period: str = "1mo") -> dict:
     """Get a stock's % return over a period.
@@ -91,7 +113,22 @@ def compare_performance(tickers: list[str], period: str = "1mo") -> list[dict]:
 
 TOOLS = [get_quote, get_performance, get_fundamentals, compare_performance]
 
-SYSTEM_PROMPT = """You are Market Buddy, a friendly capital markets assistant.
+
+TONE = {
+    "conservative": (
+        "This user is risk-averse. Lead with downside: volatility, drawdowns, "
+        "and dividend stability. Flag when something is speculative."
+    ),
+    "balanced": (
+        "This user wants a balanced view. Mention both upside and risk."
+    ),
+    "aggressive": (
+        "This user has a high risk tolerance. Focus on growth, momentum, "
+        "and relative performance. Keep risk notes brief."
+    ),
+}
+
+BASE_PROMPT = """You are Market Buddy, a friendly capital markets assistant.
 Use your tools to fetch real data before answering; never guess numbers.
 Explain results in plain English and keep answers short.
 
@@ -107,7 +144,15 @@ When the user sends a chart image:
 
 You provide information and analysis only, not buy/sell recommendations."""
 
+@dynamic_prompt
+def personalized_prompt(request: ModelRequest) -> str:
+    profile = request.runtime.context or UserProfile()
+    return f"""{BASE_PROMPT}
 
+You are speaking with {profile.name}.
+{TONE.get(profile.risk_profile, TONE["balanced"])}
+Their base currency is {profile.base_currency}. Prices from tools are
+already converted to it, so use that currency in your answers."""
 
 def _fix_block(block):
     """Convert LangChain/UI-style image blocks into OpenAI image_url blocks."""
@@ -165,9 +210,9 @@ def build_agent(checkpointer=None):
     return create_agent(
         model="openai:gpt-5-mini",  
         tools=TOOLS,
-        system_prompt=SYSTEM_PROMPT,
-        middleware=[OpenAIImageBlocks()],
+        middleware=[OpenAIImageBlocks(), personalized_prompt],
         checkpointer=checkpointer,
+        context_schema=UserProfile,
     )
 
 
@@ -182,6 +227,8 @@ if __name__ == "__main__":
     config = {"configurable": {"thread_id": "session-2"}}
 
     print("Market Buddy ready! Ask about any stock (type 'quit' to exit).\n")
+    profile = UserProfile(name="Keshav", risk_profile="aggressive", base_currency="CAD" \
+    "")
     while True:
         question = input("You: ").strip()
         if question.lower() in {"quit", "exit"}:
@@ -196,5 +243,6 @@ if __name__ == "__main__":
         result = chat_agent.invoke(
             {"messages": [build_message(question, image_path)]},
             config=config,
+            context=profile,
         )
         print(f"\nMarket Buddy: {result['messages'][-1].content}\n")
