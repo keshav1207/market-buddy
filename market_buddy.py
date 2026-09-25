@@ -4,6 +4,9 @@ Market Buddy - a simple stock Q&A agent built with LangChain.
 """
 
 import yfinance as yf
+import asyncio
+from pathlib import Path
+from langchain_mcp_adapters.client import MultiServerMCPClient
 from dotenv import load_dotenv
 from langchain.agents import create_agent
 from langchain.tools import tool, ToolRuntime
@@ -142,6 +145,9 @@ When the user sends a chart image:
 - If the image and the tool data disagree, say so explicitly and
   trust the tool data.
 
+When asked about news, recent events, or why a stock moved, use the
+news tool, and cite the publisher for each headline you mention.
+
 You provide information and analysis only, not buy/sell recommendations."""
 
 @dynamic_prompt
@@ -206,43 +212,60 @@ class OpenAIImageBlocks(AgentMiddleware):
 
 # ---------- Agent ----------
 
-def build_agent(checkpointer=None):
+
+MCP_CLIENT = MultiServerMCPClient({
+    "market-news": {
+        "command": "python",
+        "args": [str(Path(__file__).parent / "news_server.py")],
+        "transport": "stdio",
+    },
+})
+
+
+async def build_agent_async(checkpointer=None):
+    """Same agent, plus tools loaded from MCP servers."""
+    mcp_tools = await MCP_CLIENT.get_tools()
+    print(f"Loaded {len(mcp_tools)} MCP tools:",
+          [t.name for t in mcp_tools])          # remove once working
     return create_agent(
-        model="openai:gpt-5-mini",  
-        tools=TOOLS,
+        model="openai:gpt-5-mini",
+        tools=TOOLS + mcp_tools,
         middleware=[OpenAIImageBlocks(), personalized_prompt],
-        checkpointer=checkpointer,
         context_schema=UserProfile,
+        checkpointer=checkpointer,
     )
 
 
-# Used later by `langgraph dev` / Agent Chat UI (the server provides its own memory).
-agent = build_agent()
+async def make_graph():
+    """Entry point for `langgraph dev`."""
+    return await build_agent_async()
+
 
 # ---------- Terminal chat ----------
 
-if __name__ == "__main__":
-    # In the terminal we provide memory ourselves.
-    chat_agent = build_agent(checkpointer=InMemorySaver())
-    config = {"configurable": {"thread_id": "session-2"}}
+async def main():
+    chat_agent = await build_agent_async(checkpointer=InMemorySaver())
+    config = {"configurable": {"thread_id": "session-5"}}
+    profile = UserProfile(name="Keshav", risk_profile="balanced", base_currency="USD")
 
     print("Market Buddy ready! Ask about any stock (type 'quit' to exit).\n")
-    profile = UserProfile(name="Keshav", risk_profile="aggressive", base_currency="CAD" \
-    "")
     while True:
         question = input("You: ").strip()
         if question.lower() in {"quit", "exit"}:
             break
 
-        # Type: image:/path/to/chart.png What trend is this?
         image_path = None
         if question.startswith("image:"):
             _, rest = question.split(":", 1)
             image_path, question = rest.strip().split(" ", 1)
 
-        result = chat_agent.invoke(
+        result = await chat_agent.ainvoke(
             {"messages": [build_message(question, image_path)]},
             config=config,
             context=profile,
         )
         print(f"\nMarket Buddy: {result['messages'][-1].content}\n")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
