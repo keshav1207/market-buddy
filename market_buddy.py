@@ -15,7 +15,6 @@ from langchain.agents.middleware import AgentMiddleware, dynamic_prompt, ModelRe
 from dataclasses import dataclass
 import base64
 import mimetypes
-from pathlib import Path
 
 load_dotenv()
 
@@ -131,22 +130,32 @@ TONE = {
     ),
 }
 
-BASE_PROMPT = """You are Market Buddy, a friendly capital markets assistant.
-Use your tools to fetch real data before answering; never guess numbers.
-Explain results in plain English and keep answers short.
+BASE_PROMPT =  """You are Market Buddy, a friendly capital markets assistant.
+You don't fetch data yourself. You have two specialists:
+- market_data: prices, returns, valuation, comparisons
+- company_news: recent headlines
+
+Always send them complete, self-contained questions. They have no memory
+and cannot see this conversation, so include the ticker and period every
+time. If a question needs both numbers and news, call both.
+
+Combine what they return into one short answer in plain English.
+Never invent numbers; if a specialist didn't return something, say so.
+Answer only from what the specialists return. 
+
+Do not add general
+commentary about a company from your own knowledge.
+Do not list what you didn't fetch. End with at most one short
+follow-up offer, and only when it's genuinely useful.
 
 When the user sends a chart image:
 - Say what you can actually see: ticker, timeframe, overall direction,
   notable spikes or drops, and any visible axis values.
 - Never state precise prices or percentages read off the image.
-- If you can identify the ticker and timeframe, call get_performance
-  to confirm the real numbers, and give those instead.
+- If you can identify the ticker and timeframe, ask market_data to
+  confirm the real numbers, and give those instead.
 - Say so plainly if the image is unreadable or isn't a price chart.
-- If the image and the tool data disagree, say so explicitly and
-  trust the tool data.
-
-When asked about news, recent events, or why a stock moved, use the
-news tool, and cite the publisher for each headline you mention.
+- If the image and the data disagree, say so and trust the data.
 
 You provide information and analysis only, not buy/sell recommendations."""
 
@@ -222,19 +231,61 @@ MCP_CLIENT = MultiServerMCPClient({
 })
 
 
+DATA_AGENT_PROMPT = """You are a market data specialist.
+Use your tools to fetch real numbers. Never guess.
+Return just the facts you found, compactly. No advice, no framing."""
+
+NEWS_AGENT_PROMPT = """You are a financial news specialist.
+Use your tools to fetch headlines. Return title, publisher, and a one-line
+summary for each. Say plainly if a story isn't about the company asked about.
+No advice, no framing."""
+
+
 async def build_agent_async(checkpointer=None):
-    """Same agent, plus tools loaded from MCP servers."""
     mcp_tools = await MCP_CLIENT.get_tools()
-    print(f"Loaded {len(mcp_tools)} MCP tools:",
-          [t.name for t in mcp_tools])          # remove once working
+
+    market_data_agent = create_agent(
+        model="openai:gpt-5-mini",
+        tools=TOOLS,
+        system_prompt=DATA_AGENT_PROMPT,
+        context_schema=UserProfile,
+    )
+
+    news_agent = create_agent(
+        model="openai:gpt-5-mini",
+        tools=mcp_tools,
+        system_prompt=NEWS_AGENT_PROMPT,
+    )
+
+    @tool("market_data", description=(
+        "Get stock prices, returns, valuation ratios, or comparisons between "
+        "tickers. Send a complete question including the ticker(s) and period, "
+        "e.g. 'AAPL price and 6-month return'."
+    ))
+    async def call_market_data(query: str, runtime: ToolRuntime[UserProfile]) -> str:
+        result = await market_data_agent.ainvoke(
+            {"messages": [{"role": "user", "content": query}]},
+            context=runtime.context or UserProfile(),
+        )
+        return result["messages"][-1].content
+
+    @tool("company_news", description=(
+        "Get recent news headlines about a company. Send a complete question "
+        "including the ticker, e.g. 'recent news about NVDA'."
+    ))
+    async def call_news(query: str) -> str:
+        result = await news_agent.ainvoke(
+            {"messages": [{"role": "user", "content": query}]},
+        )
+        return result["messages"][-1].content
+
     return create_agent(
         model="openai:gpt-5-mini",
-        tools=TOOLS + mcp_tools,
+        tools=[call_market_data, call_news],
         middleware=[OpenAIImageBlocks(), personalized_prompt],
         context_schema=UserProfile,
         checkpointer=checkpointer,
     )
-
 
 async def make_graph():
     """Entry point for `langgraph dev`."""
@@ -245,8 +296,8 @@ async def make_graph():
 
 async def main():
     chat_agent = await build_agent_async(checkpointer=InMemorySaver())
-    config = {"configurable": {"thread_id": "session-5"}}
-    profile = UserProfile(name="Keshav", risk_profile="balanced", base_currency="USD")
+    config = {"configurable": {"thread_id": "session-4"}}
+    profile = UserProfile(name="Keshav", risk_profile="balanced", base_currency="CAD")
 
     print("Market Buddy ready! Ask about any stock (type 'quit' to exit).\n")
     while True:
