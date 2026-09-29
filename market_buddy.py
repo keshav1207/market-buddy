@@ -11,14 +11,24 @@ from dotenv import load_dotenv
 from langchain.agents import create_agent
 from langchain.tools import tool, ToolRuntime
 from langgraph.checkpoint.memory import InMemorySaver
-from langchain.agents.middleware import AgentMiddleware, dynamic_prompt, ModelRequest,SummarizationMiddleware
+from langchain.agents.middleware import AgentMiddleware, dynamic_prompt, ModelRequest,SummarizationMiddleware, HumanInTheLoopMiddleware
+from langgraph.types import Command
 from dataclasses import dataclass
 import base64
 import mimetypes
+import json
 
 load_dotenv()
 
 
+
+WATCHLIST_FILE = Path(__file__).parent / "watchlist.json"
+
+
+def _load_watchlist() -> list[str]:
+    if WATCHLIST_FILE.exists():
+        return json.loads(WATCHLIST_FILE.read_text())
+    return []
 
 @dataclass
 class UserProfile:
@@ -111,9 +121,27 @@ def compare_performance(tickers: list[str], period: str = "1mo") -> list[dict]:
         reverse=True,
     )
 
+@tool
+def view_watchlist() -> list[str]:
+    """Show the tickers currently on the user's watchlist."""
+    return _load_watchlist()
+
+
+@tool
+def add_to_watchlist(ticker: str) -> str:
+    """Add a ticker to the user's saved watchlist."""
+    tickers = _load_watchlist()
+    code = ticker.upper()
+    if code in tickers:
+        return f"{code} is already on the watchlist."
+    tickers.append(code)
+    WATCHLIST_FILE.write_text(json.dumps(tickers))
+    return f"Added {code}. Watchlist is now: {', '.join(tickers)}"
+
 
 
 TOOLS = [get_quote, get_performance, get_fundamentals, compare_performance]
+
 
 
 TONE = {
@@ -156,6 +184,11 @@ When the user sends a chart image:
   confirm the real numbers, and give those instead.
 - Say so plainly if the image is unreadable or isn't a price chart.
 - If the image and the data disagree, say so and trust the data.
+
+You also manage the user's watchlist directly with view_watchlist and
+add_to_watchlist. When the user asks to add a ticker, call
+add_to_watchlist immediately. Don't fetch prices or news first, and
+don't ask for confirmation in text; the system asks for approval itself.
 
 You provide information and analysis only, not buy/sell recommendations."""
 
@@ -281,11 +314,19 @@ async def build_agent_async(checkpointer=None):
 
     return create_agent(
         model="openai:gpt-5-mini",
-        tools=[call_market_data, call_news],
+        tools=[call_market_data, call_news, view_watchlist, add_to_watchlist],
         middleware=[OpenAIImageBlocks(), personalized_prompt, SummarizationMiddleware(
                 model="openai:gpt-5-mini",
                 trigger=("messages", 8),     # low on purpose, so you can watch it
                 keep=("messages", 4),
+            ), HumanInTheLoopMiddleware(
+                interrupt_on={
+                    "add_to_watchlist": {
+                        "allowed_decisions": ["approve", "reject"],
+                        "description": "Add a ticker to your saved watchlist",
+                    },
+                    "view_watchlist": False,      # read-only, no approval
+                },
             ),],
         context_schema=UserProfile,
         checkpointer=checkpointer,
@@ -295,6 +336,11 @@ async def make_graph():
     """Entry point for `langgraph dev`."""
     return await build_agent_async()
 
+def _interrupts(result):
+    """Pending interrupts, whichever shape the result takes."""
+    if isinstance(result, dict):
+        return result.get("__interrupt__") or []
+    return list(getattr(result, "interrupts", []) or [])
 
 # ---------- Terminal chat ----------
 
@@ -319,6 +365,22 @@ async def main():
             config=config,
             context=profile,
         )
+
+        while _interrupts(result):
+            pending = _interrupts(result)[0].value
+            for req in pending["action_requests"]:
+                print(f"\n[approval needed] {req['name']}({req['args']})")
+
+            answer = input("approve / reject: ").strip().lower()
+            decision = (
+                {"type": "approve"} if answer.startswith("a")
+                else {"type": "reject", "message": "User declined this action."}
+            )
+            result = await chat_agent.ainvoke(
+                Command(resume={"decisions": [decision]}),
+                config=config,
+                context=profile,
+            )
         print(f"\nMarket Buddy: {result['messages'][-1].content}\n")
         
 
