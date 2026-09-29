@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 from langchain.agents import create_agent
 from langchain.tools import tool, ToolRuntime
 from langgraph.checkpoint.memory import InMemorySaver
-from langchain.agents.middleware import AgentMiddleware, dynamic_prompt, ModelRequest
+from langchain.agents.middleware import AgentMiddleware, dynamic_prompt, ModelRequest,SummarizationMiddleware
 from dataclasses import dataclass
 import base64
 import mimetypes
@@ -282,7 +282,11 @@ async def build_agent_async(checkpointer=None):
     return create_agent(
         model="openai:gpt-5-mini",
         tools=[call_market_data, call_news],
-        middleware=[OpenAIImageBlocks(), personalized_prompt],
+        middleware=[OpenAIImageBlocks(), personalized_prompt, SummarizationMiddleware(
+                model="openai:gpt-5-mini",
+                trigger=("messages", 8),     # low on purpose, so you can watch it
+                keep=("messages", 4),
+            ),],
         context_schema=UserProfile,
         checkpointer=checkpointer,
     )
@@ -316,7 +320,7 @@ async def main():
             context=profile,
         )
         print(f"\nMarket Buddy: {result['messages'][-1].content}\n")
-
+        
 
 if __name__ == "__main__":
     asyncio.run(main())
