@@ -1,34 +1,43 @@
 """
-Market Buddy - a simple stock Q&A agent built with LangChain.
+Market Buddy - a capital markets agent built with LangChain.
 
+Covers: tools, short-term memory, multimodal messages, MCP, runtime context,
+multi-agent supervision, and middleware (summarization, human-in-the-loop,
+dynamic model routing).
+
+Run in the terminal:   python market_buddy.py
+Run as a server:       langgraph dev   (then use Agent Chat UI)
 """
 
-import yfinance as yf
 import asyncio
+import base64
+import json
+import mimetypes
+import sys
+from dataclasses import dataclass
 from pathlib import Path
-from langchain_mcp_adapters.client import MultiServerMCPClient
+
+import yfinance as yf
 from dotenv import load_dotenv
 from langchain.agents import create_agent
-from langchain.tools import tool, ToolRuntime
+from langchain.agents.middleware import (
+    AgentMiddleware,
+    HumanInTheLoopMiddleware,
+    ModelRequest,
+    SummarizationMiddleware,
+    dynamic_prompt,
+    wrap_model_call,
+)
+from langchain.chat_models import init_chat_model
+from langchain.tools import ToolRuntime, tool
+from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.checkpoint.memory import InMemorySaver
-from langchain.agents.middleware import AgentMiddleware, dynamic_prompt, ModelRequest,SummarizationMiddleware, HumanInTheLoopMiddleware
 from langgraph.types import Command
-from dataclasses import dataclass
-import base64
-import mimetypes
-import json
 
 load_dotenv()
 
 
-
-WATCHLIST_FILE = Path(__file__).parent / "watchlist.json"
-
-
-def _load_watchlist() -> list[str]:
-    if WATCHLIST_FILE.exists():
-        return json.loads(WATCHLIST_FILE.read_text())
-    return []
+# ---------- User context ----------
 
 @dataclass
 class UserProfile:
@@ -36,6 +45,22 @@ class UserProfile:
     risk_profile: str = "balanced"     # conservative | balanced | aggressive
     base_currency: str = "USD"
 
+
+# ---------- Watchlist storage ----------
+# Note: this is a single shared file, so the watchlist is global rather than
+# per-user. Fine for a learning project; a real app would key it by user id.
+
+WATCHLIST_FILE = Path(__file__).parent / "watchlist.json"
+
+
+def _load_watchlist() -> list[str]:
+    try:
+        return json.loads(WATCHLIST_FILE.read_text())
+    except Exception:
+        return []
+
+
+# ---------- Helpers ----------
 
 def _fx_rate(to_currency: str) -> float:
     """USD -> to_currency rate. Returns 1.0 for USD or on failure."""
@@ -47,10 +72,10 @@ def _fx_rate(to_currency: str) -> float:
     except Exception:
         return 1.0
 
+
 # ---------- Tools ----------
 # The model only sees each tool's name, docstring, and argument types.
-
-
+# ToolRuntime parameters are excluded from that schema.
 
 @tool
 def get_quote(ticker: str, runtime: ToolRuntime[UserProfile]) -> dict:
@@ -63,24 +88,34 @@ def get_quote(ticker: str, runtime: ToolRuntime[UserProfile]) -> dict:
     return {
         "ticker": ticker.upper(),
         "price": round(info.last_price * rate, 2),
-       "market_cap_usd": info.market_cap,
+        "market_cap_usd": info.market_cap,
         "52w_high": round(info.year_high * rate, 2),
         "52w_low": round(info.year_low * rate, 2),
         "currency": profile.base_currency if rate != 1.0 else info.currency,
     }
+
+
 @tool
-def get_performance(ticker: str, period: str = "1mo") -> dict:
+def get_performance(ticker: str, runtime: ToolRuntime[UserProfile],
+                    period: str = "1mo") -> dict:
     """Get a stock's % return over a period.
     Valid periods: 5d, 1mo, 3mo, 6mo, 1y, ytd, 5y."""
-    hist = yf.Ticker(ticker).history(period=period)
+    profile = runtime.context or UserProfile()
+    t = yf.Ticker(ticker)
+    hist = t.history(period=period)
     if hist.empty:
         return {"error": f"No data found for {ticker}"}
+
+    native = t.fast_info.currency
+    rate = _fx_rate(profile.base_currency) if native == "USD" else 1.0
+
     start, end = hist["Close"].iloc[0], hist["Close"].iloc[-1]
     return {
         "ticker": ticker.upper(),
         "period": period,
-        "start_price": round(start, 2),
-        "end_price": round(end, 2),
+        "start_price": round(start * rate, 2),
+        "end_price": round(end * rate, 2),
+        "currency": profile.base_currency if rate != 1.0 else native,
         "return_pct": round((end - start) / start * 100, 2),
     }
 
@@ -99,8 +134,9 @@ def get_fundamentals(ticker: str) -> dict:
         "beta": info.get("beta"),
     }
 
+
 @tool
-def compare_performance(tickers: list[str], period: str = "1mo") -> list[dict]:
+def compare_performance(tickers: list[str], period: str = "1mo") -> dict:
     """Compare the % return of MULTIPLE stock tickers over the same period.
     Use this instead of get_performance when the user asks about
     two or more stocks. Valid periods: 5d, 1mo, 3mo, 6mo, 1y, ytd, 5y."""
@@ -115,11 +151,16 @@ def compare_performance(tickers: list[str], period: str = "1mo") -> list[dict]:
             "ticker": ticker.upper(),
             "return_pct": round((end - start) / start * 100, 2),
         })
-    return sorted(
-        results,
-        key=lambda r: r.get("return_pct", float("-inf")),
-        reverse=True,
-    )
+    return {
+        "period": period,
+        "note": "Percent returns only; currency-independent.",
+        "results": sorted(
+            results,
+            key=lambda r: r.get("return_pct", float("-inf")),
+            reverse=True,
+        ),
+    }
+
 
 @tool
 def view_watchlist() -> list[str]:
@@ -139,10 +180,11 @@ def add_to_watchlist(ticker: str) -> str:
     return f"Added {code}. Watchlist is now: {', '.join(tickers)}"
 
 
-
+# Tools for the market data subagent.
 TOOLS = [get_quote, get_performance, get_fundamentals, compare_performance]
 
 
+# ---------- Prompts ----------
 
 TONE = {
     "conservative": (
@@ -150,7 +192,9 @@ TONE = {
         "and dividend stability. Flag when something is speculative."
     ),
     "balanced": (
-        "This user wants a balanced view. Mention both upside and risk."
+        "This user wants a balanced view. When the data supports it, mention "
+        "both upside and risk. If the data doesn't support any assessment, "
+        "skip it rather than stating generalities."
     ),
     "aggressive": (
         "This user has a high risk tolerance. Focus on growth, momentum, "
@@ -158,8 +202,9 @@ TONE = {
     ),
 }
 
-BASE_PROMPT =  """You are Market Buddy, a friendly capital markets assistant.
-You don't fetch data yourself. You have two specialists:
+BASE_PROMPT = """You are Market Buddy, a friendly capital markets assistant.
+
+You don't fetch market data yourself. You have two specialists:
 - market_data: prices, returns, valuation, comparisons
 - company_news: recent headlines
 
@@ -167,14 +212,19 @@ Always send them complete, self-contained questions. They have no memory
 and cannot see this conversation, so include the ticker and period every
 time. If a question needs both numbers and news, call both.
 
-Combine what they return into one short answer in plain English.
-Never invent numbers; if a specialist didn't return something, say so.
-Answer only from what the specialists return. 
+You also manage the user's watchlist directly with view_watchlist and
+add_to_watchlist. When the user asks to add a ticker, call add_to_watchlist
+immediately. Don't fetch prices or news first, and don't ask for confirmation
+in text; the system asks for approval itself.
 
-Do not add general
+Combine what the specialists return into one short answer in plain English.
+Answer only from what they return. Never invent numbers and don't add general
 commentary about a company from your own knowledge.
-Do not list what you didn't fetch. End with at most one short
-follow-up offer, and only when it's genuinely useful.
+Only mention missing data if the user specifically asked for it.
+End with at most one short follow-up question, under 12 words, or none at all.
+
+Currency: market_cap_usd is always in USD, never the user's currency.
+Percent returns are currency-independent.
 
 When the user sends a chart image:
 - Say what you can actually see: ticker, timeframe, overall direction,
@@ -185,15 +235,12 @@ When the user sends a chart image:
 - Say so plainly if the image is unreadable or isn't a price chart.
 - If the image and the data disagree, say so and trust the data.
 
-You also manage the user's watchlist directly with view_watchlist and
-add_to_watchlist. When the user asks to add a ticker, call
-add_to_watchlist immediately. Don't fetch prices or news first, and
-don't ask for confirmation in text; the system asks for approval itself.
-
 You provide information and analysis only, not buy/sell recommendations."""
+
 
 @dynamic_prompt
 def personalized_prompt(request: ModelRequest) -> str:
+    """Adapt the system prompt to the user's profile on every model call."""
     profile = request.runtime.context or UserProfile()
     return f"""{BASE_PROMPT}
 
@@ -201,6 +248,9 @@ You are speaking with {profile.name}.
 {TONE.get(profile.risk_profile, TONE["balanced"])}
 Their base currency is {profile.base_currency}. Prices from tools are
 already converted to it, so use that currency in your answers."""
+
+
+# ---------- Image handling ----------
 
 def _fix_block(block):
     """Convert LangChain/UI-style image blocks into OpenAI image_url blocks."""
@@ -224,6 +274,17 @@ def _fix_messages(messages):
         fixed.append(msg)
     return fixed
 
+
+class OpenAIImageBlocks(AgentMiddleware):
+    """Rewrite image blocks on every model call (sync and async)."""
+
+    def wrap_model_call(self, request, handler):
+        return handler(request.override(messages=_fix_messages(request.messages)))
+
+    async def awrap_model_call(self, request, handler):
+        return await handler(request.override(messages=_fix_messages(request.messages)))
+
+
 def build_message(text: str, image_path: str | None = None) -> dict:
     """Build a user message, optionally carrying an image."""
     if not image_path:
@@ -243,26 +304,66 @@ def build_message(text: str, image_path: str | None = None) -> dict:
             },
         ],
     }
-class OpenAIImageBlocks(AgentMiddleware):
-    """Rewrite image blocks on every model call (sync and async)."""
 
-    def wrap_model_call(self, request, handler):
-        return handler(request.override(messages=_fix_messages(request.messages)))
 
-    async def awrap_model_call(self, request, handler):
-        return await handler(request.override(messages=_fix_messages(request.messages)))
+# ---------- Dynamic model routing ----------
 
-# ---------- Agent ----------
+FAST_MODEL = init_chat_model("openai:gpt-5-nano")
+DEFAULT_MODEL = init_chat_model("openai:gpt-5-mini")
 
+SIMPLE_PATTERNS = (
+    "price", "trading at", "quote", "worth", "watchlist", "market cap",
+)
+
+
+def _last_human_text(messages) -> str:
+    for msg in reversed(messages):
+        if msg.__class__.__name__ == "HumanMessage":
+            if isinstance(msg.content, list):
+                return " ".join(
+                    b.get("text", "") for b in msg.content if isinstance(b, dict)
+                ).lower()
+            return str(msg.content).lower()
+    return ""
+
+
+@wrap_model_call
+async def route_model(request, handler):
+    """Use a cheaper model for simple lookups; never for image questions."""
+    messages = request.messages
+    text = _last_human_text(messages)
+
+    has_image = any(
+        isinstance(m.content, list)
+        and any(
+            isinstance(b, dict) and b.get("type") in ("image_url", "image")
+            for b in m.content
+        )
+        for m in messages
+    )
+
+    simple = (
+        not has_image
+        and len(text.split()) <= 12
+        and any(p in text for p in SIMPLE_PATTERNS)
+    )
+    return await handler(
+        request.override(model=FAST_MODEL if simple else DEFAULT_MODEL)
+    )
+
+
+# ---------- MCP ----------
 
 MCP_CLIENT = MultiServerMCPClient({
     "market-news": {
-        "command": "python",
+        "command": sys.executable,
         "args": [str(Path(__file__).parent / "news_server.py")],
         "transport": "stdio",
     },
 })
 
+
+# ---------- Agents ----------
 
 DATA_AGENT_PROMPT = """You are a market data specialist.
 Use your tools to fetch real numbers. Never guess.
@@ -275,6 +376,7 @@ No advice, no framing."""
 
 
 async def build_agent_async(checkpointer=None):
+    """Supervisor agent with two subagents, MCP tools, and middleware."""
     mcp_tools = await MCP_CLIENT.get_tools()
 
     market_data_agent = create_agent(
@@ -298,7 +400,7 @@ async def build_agent_async(checkpointer=None):
     async def call_market_data(query: str, runtime: ToolRuntime[UserProfile]) -> str:
         result = await market_data_agent.ainvoke(
             {"messages": [{"role": "user", "content": query}]},
-            context=runtime.context or UserProfile(),
+            context=runtime.context or UserProfile(),   # context must be forwarded
         )
         return result["messages"][-1].content
 
@@ -315,11 +417,16 @@ async def build_agent_async(checkpointer=None):
     return create_agent(
         model="openai:gpt-5-mini",
         tools=[call_market_data, call_news, view_watchlist, add_to_watchlist],
-        middleware=[OpenAIImageBlocks(), personalized_prompt, SummarizationMiddleware(
+        middleware=[
+            route_model,
+            OpenAIImageBlocks(),
+            personalized_prompt,
+            SummarizationMiddleware(
                 model="openai:gpt-5-mini",
-                trigger=("messages", 8),     # low on purpose, so you can watch it
+                trigger=("messages", 8),
                 keep=("messages", 4),
-            ), HumanInTheLoopMiddleware(
+            ),
+            HumanInTheLoopMiddleware(
                 interrupt_on={
                     "add_to_watchlist": {
                         "allowed_decisions": ["approve", "reject"],
@@ -327,14 +434,19 @@ async def build_agent_async(checkpointer=None):
                     },
                     "view_watchlist": False,      # read-only, no approval
                 },
-            ),],
+            ),
+        ],
         context_schema=UserProfile,
         checkpointer=checkpointer,
     )
 
+
 async def make_graph():
-    """Entry point for `langgraph dev`."""
+    """Entry point for `langgraph dev` (see langgraph.json)."""
     return await build_agent_async()
+
+
+# ---------- Terminal chat ----------
 
 def _interrupts(result):
     """Pending interrupts, whichever shape the result takes."""
@@ -342,14 +454,15 @@ def _interrupts(result):
         return result.get("__interrupt__") or []
     return list(getattr(result, "interrupts", []) or [])
 
-# ---------- Terminal chat ----------
 
 async def main():
     chat_agent = await build_agent_async(checkpointer=InMemorySaver())
-    config = {"configurable": {"thread_id": "session-4"}}
+    config = {"configurable": {"thread_id": "session-1"}}
     profile = UserProfile(name="Keshav", risk_profile="balanced", base_currency="CAD")
 
-    print("Market Buddy ready! Ask about any stock (type 'quit' to exit).\n")
+    print("Market Buddy ready! Ask about any stock (type 'quit' to exit).")
+    print("Send a chart with:  image:chart.png What trend is this?\n")
+
     while True:
         question = input("You: ").strip()
         if question.lower() in {"quit", "exit"}:
@@ -366,6 +479,7 @@ async def main():
             context=profile,
         )
 
+        # The run may pause for approval, possibly more than once.
         while _interrupts(result):
             pending = _interrupts(result)[0].value
             for req in pending["action_requests"]:
@@ -381,8 +495,9 @@ async def main():
                 config=config,
                 context=profile,
             )
+
         print(f"\nMarket Buddy: {result['messages'][-1].content}\n")
-        
+
 
 if __name__ == "__main__":
     asyncio.run(main())
